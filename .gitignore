@@ -1,0 +1,31 @@
+# Секреты и окружение
+.env
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# Локальные индексы / кэш (пересобираются scripts/build_rag.py)
+data/chroma/
+chroma_db/
+.chroma/
+pdf_preview/
+
+# Временные прогоны UI
+data/jobs/
+data/patient_runs/
+data/stress_report.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
