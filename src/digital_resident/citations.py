@@ -96,8 +96,8 @@ def validate_and_repair_plan(
                 else:
                     issues.append(
                         {
+                            "category": "citation",
                             "severity": "high",
-                            "severity": "citation",
                             "title": "Недопустимая цитата вне RAG-контекста",
                             "detail": f"Ссылка {ref} отсутствует среди переданных фрагментов КР.",
                             "evidence": str(item)[:240],
@@ -111,14 +111,65 @@ def validate_and_repair_plan(
         ):
             issues.append(
                 {
+                    "category": "citation",
                     "severity": "medium",
-                    "severity": "citation",
                     "title": "Назначение/пункт без валидной цитаты",
                     "detail": "После валидации не осталось допустимых ссылок [N].",
                     "evidence": str(item)[:240],
                     "recommendation": "Привязать пункт к релевантному фрагменту КР.",
                 }
             )
+        # semantic: medication cite should mention drug/class or dose table
+        if item.get("name") and item.get("citations"):
+            name_l = str(item.get("name") or "").lower()
+            tokens = [
+                t
+                for t in re.split(r"[^\wа-яА-ЯёЁ]+", name_l)
+                if len(t) >= 4
+            ]
+            class_tokens = [
+                "иапф",
+                "бра",
+                "сартан",
+                "амлодипин",
+                "диуретик",
+                "тиазид",
+                "спиронолактон",
+                "комбинац",
+                "доз",
+                "мг",
+                "ираас",
+                "гипертенз",
+            ]
+            hit_ok = False
+            for ref in item["citations"]:
+                meta = catalog.get(ref) or {}
+                # need full text — look up from hits
+                blob = " ".join(
+                    str(meta.get(k) or "") for k in ("section", "text_preview", "chunk_id")
+                ).lower()
+                for h in hits:
+                    cid = h.get("chunk_id") or h.get("id")
+                    if cid == meta.get("chunk_id"):
+                        blob += " " + (h.get("text") or "").lower()
+                        break
+                if any(t in blob for t in tokens) or any(t in blob for t in class_tokens):
+                    hit_ok = True
+                    break
+            if not hit_ok:
+                issues.append(
+                    {
+                        "category": "citation",
+                        "severity": "medium",
+                        "title": "Цитата не подтверждает препарат/дозу",
+                        "detail": (
+                            f"Для «{item.get('name')}» ссылки {item['citations']} "
+                            "не содержат имени/класса препарата или дозовой таблицы."
+                        ),
+                        "evidence": str(item)[:240],
+                        "recommendation": "Цитировать фрагмент про классы АГП / справочник доз.",
+                    }
+                )
         return item
 
     out = dict(plan)

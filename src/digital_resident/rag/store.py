@@ -11,6 +11,8 @@ from digital_resident.config import has_llm_api_key, settings
 from digital_resident.llm import get_llm
 from digital_resident.rag.chunker import load_or_build_chunks, save_chunks
 
+_VECTOR_DISABLED = False
+
 
 class GuidelineRAG:
     def __init__(self) -> None:
@@ -57,26 +59,51 @@ class GuidelineRAG:
     def _all_chunks(self) -> list[dict[str, Any]]:
         if self._cache is not None:
             return self._cache
+        from digital_resident.rag.chunker import build_curated_chunks
+
+        by_id: dict[str, dict[str, Any]] = {}
+        # curated always available (dose table, angioedema fix) even without rebuild
+        for c in build_curated_chunks():
+            cid = c["id"]
+            by_id[cid] = {
+                "chunk_id": cid,
+                "id": cid,
+                "text": c.get("text") or "",
+                "section": c.get("section", ""),
+                "page": c.get("page", ""),
+                "source": c.get("source", ""),
+                "citation": f"{c.get('section', 'КР')} (стр. {c.get('page', '?')})",
+            }
         if self.count > 0:
             raw = self.collection.get(include=["documents", "metadatas"])
-            out = []
             for i, cid in enumerate(raw["ids"]):
                 meta = (raw["metadatas"] or [{}])[i] or {}
-                out.append(
-                    {
-                        "chunk_id": cid,
-                        "id": cid,
-                        "text": (raw["documents"] or [""])[i] or "",
-                        "section": meta.get("section", ""),
-                        "page": meta.get("page", ""),
-                        "source": meta.get("source", ""),
-                        "citation": f"{meta.get('section', 'КР')} (стр. {meta.get('page', '?')})",
-                    }
-                )
-            self._cache = out
-            return out
-        # без Chroma / без API — keyword-RAG по сохранённым chunks.json
-        self._cache = self._chunks_from_json()
+                by_id[cid] = {
+                    "chunk_id": cid,
+                    "id": cid,
+                    "text": (raw["documents"] or [""])[i] or "",
+                    "section": meta.get("section", ""),
+                    "page": meta.get("page", ""),
+                    "source": meta.get("source", ""),
+                    "citation": f"{meta.get('section', 'КР')} (стр. {meta.get('page', '?')})",
+                }
+            # re-apply curated overrides (newer text)
+            for c in build_curated_chunks():
+                cid = c["id"]
+                by_id[cid] = {
+                    "chunk_id": cid,
+                    "id": cid,
+                    "text": c.get("text") or "",
+                    "section": c.get("section", ""),
+                    "page": c.get("page", ""),
+                    "source": c.get("source", ""),
+                    "citation": f"{c.get('section', 'КР')} (стр. {c.get('page', '?')})",
+                }
+        else:
+            for c in self._chunks_from_json():
+                if c["chunk_id"] not in {x["id"] for x in build_curated_chunks()}:
+                    by_id[c["chunk_id"]] = c
+        self._cache = list(by_id.values())
         return self._cache
 
     def build(self, force: bool = False) -> int:
@@ -123,14 +150,39 @@ class GuidelineRAG:
         return self.count
 
     def _vector_search(self, query: str, k: int) -> list[dict[str, Any]]:
-        if not has_llm_api_key() or self.count == 0:
+        global _VECTOR_DISABLED
+        if _VECTOR_DISABLED or not has_llm_api_key() or self.count == 0:
             return []
-        emb = get_llm().embed([query])[0]
-        res = self.collection.query(
-            query_embeddings=[emb],
-            n_results=min(max(k, 1), max(self.count, 1)),
-            include=["documents", "metadatas", "distances"],
-        )
+        try:
+            import threading
+            from queue import Empty, Queue
+
+            q: Queue = Queue(maxsize=1)
+
+            def _embed() -> None:
+                try:
+                    q.put(("ok", get_llm().embed([query])[0]))
+                except Exception as exc:  # noqa: BLE001
+                    q.put(("err", exc))
+
+            # daemon: не блокирует выход процесса, если API завис
+            threading.Thread(target=_embed, daemon=True).start()
+            try:
+                kind, payload = q.get(timeout=6)
+            except Empty as exc:
+                raise TimeoutError("embedding timeout") from exc
+            if kind == "err":
+                raise payload  # type: ignore[misc]
+            emb = payload
+            res = self.collection.query(
+                query_embeddings=[emb],
+                n_results=min(max(k, 1), max(self.count, 1)),
+                include=["documents", "metadatas", "distances"],
+            )
+        except Exception:
+            # нет сети / API / timeout — дальше только keyword+must
+            _VECTOR_DISABLED = True
+            return []
         out: list[dict[str, Any]] = []
         if not res["documents"] or not res["documents"][0]:
             return out
@@ -246,12 +298,13 @@ class GuidelineRAG:
             ),
             "противопоказания иАПФ БРА гиперкалиемия ангионевротический отек мониторинг калия СКФ",
         ]
-        must = ["cur_start_combo", "cur_five_classes", "cur_monitoring_labs"]
+        must = ["cur_start_combo", "cur_five_classes", "cur_monitoring_labs", "cur_dose_table"]
         allergies = " ".join(patient.get("allergies") or []).lower()
         dx_l = dx.lower()
         if "ангио" in allergies or "эналаприл" in allergies or "иапф" in allergies:
             must += ["cur_angioedema", "cur_iraas_contra"]
             queries.append("ангионевротический отек иАПФ предпочтение БРА")
+        queries.append("стартовые дозы периндоприл валсартан амлодипин мг")
         egfr = float(labs.get("egfr") or 999)
         if (
             egfr < 60

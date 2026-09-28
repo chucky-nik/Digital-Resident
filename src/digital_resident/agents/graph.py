@@ -38,6 +38,10 @@ SYSTEM = (
     "Цитировать можно ТОЛЬКО как [N] из списка допустимых источников. "
     "В citations_used section и page копируй РОВНО из списка. "
     "Не выдумывай пункты КР. Не назначай препараты вне контекста. "
+    "Дозу указывай ЧИСЛОМ в мг (например «5 мг 1 р/сут»). "
+    "Запрещены формулировки «начальная доза», «по инструкции», «отмена или снижение». "
+    "Если точной дозы нет во фрагментах — возьми стартовую из справочника доз в контексте "
+    "или добавь uncertainty; не выдумывай сверхвысокие мг. "
     "Пациентские данные — синтетические. Прототип CDS, не замена врачу. "
     "Верни строго JSON без markdown."
 )
@@ -103,6 +107,10 @@ def _patient_constraints(patient: dict[str, Any]) -> str:
         lines.append("- Процедура: отметь отсутствие информированного согласия (status=missing).")
     lines.append("- Обязателен мониторинг K+ и рСКФ при иРААС.")
     lines.append("- ЗАПРЕТ: комбинация иАПФ+БРА (двойная блокада РААС).")
+    lines.append(
+        "- Дозы только в мг из справочника/КР (периндоприл 5, амлодипин 5, "
+        "валсартан 80, лозартан 50 и т.п.). Не писать «начальная доза»."
+    )
     return "\n".join(lines)
 
 
@@ -146,7 +154,7 @@ def node_plan(state: PipelineState) -> PipelineState:
   "summary": "кратко",
   "goals": ["целевое АД ..."],
   "examinations": [{{"item":"...","rationale":"...","citations":["[1]"]}}],
-  "medications": [{{"name":"конкретный класс/препарат","dose":"...","rationale":"...","citations":["[1]"]}}],
+  "medications": [{{"name":"конкретный препарат","dose":"N мг 1 р/сут","rationale":"...","citations":["[1]"]}}],
   "monitoring": [{{"item":"K+ и рСКФ ...","citations":["[n]"]}}],
   "procedural_checklist": [{{"item":"...","status":"ok|missing|na"}}],
   "drug_conflict_check": {{"dual_raas": false, "iraas_mra": false, "notes": "..."}},
@@ -154,6 +162,7 @@ def node_plan(state: PipelineState) -> PipelineState:
   "uncertainties": []
 }}
 Имена препаратов указывай конкретно (например: валсартан + амлодипин), без противоречий классов.
+dose — обязательная числовая доза в мг; запрещены «начальная доза» / «по инструкции».
 """
     raw = llm.chat(prompt, system=SYSTEM, temperature=0.05, max_tokens=2800)
     plan = _parse_json(raw)
@@ -193,6 +202,7 @@ def node_replan(state: PipelineState) -> PipelineState:
             "cur_thiazide_ckd",
             "cur_monitoring_labs",
             "cur_ckd_start",
+            "cur_dose_table",
         ],
     )
     ctx = rag.format_context(hits)
@@ -218,16 +228,20 @@ def node_replan(state: PipelineState) -> PipelineState:
 {{
   "trigger": "...",
   "changes": ["..."],
-  "medications": [{{"name":"...","dose":"...","action":"start|stop|reduce|continue","rationale":"...","citations":["[1]"]}}],
+  "medications": [{{"name":"...","dose":"N мг 1 р/сут или отмена (stop)","action":"start|stop|continue","rationale":"...","citations":["[1]"]}}],
   "monitoring": [{{"item":"...","citations":["[n]"]}}],
   "citations_used": [{{"ref":"[1]","section":"...","page":"..."}}],
   "uncertainties": []
 }}
-При K+≥5.5 — stop/reduce иРААС с цитатой на противопоказание.
+При K+≥5.5 — ОБЯЗАТЕЛЬНО action=stop для иАПФ/БРА/спиронолактона (не «reduce», не «отмена или снижение»).
+Сохраняемые препараты (АК и др.) — с конкретной дозой в мг.
 """
     raw = llm.chat(prompt, system=SYSTEM, temperature=0.05, max_tokens=2200)
     revised = _parse_json(raw)
     revised = enforce_plan_constraints(state["patient"], revised)
+    from digital_resident.dosing import enforce_iraas_stop_on_hyperkalemia
+
+    revised = enforce_iraas_stop_on_hyperkalemia(revised, state.get("trajectory"))
     revised, cite_issues = validate_and_repair_plan(revised, hits)
     prev = list(state.get("citation_issues") or [])
     return {
@@ -264,7 +278,7 @@ def node_audit(state: PipelineState) -> PipelineState:
     for issue in state.get("citation_issues") or []:
         rule_findings.append(
             {
-                "severity": issue.get("severity", "citation"),
+                "category": issue.get("category", "citation"),
                 "severity": issue.get("severity", "medium"),
                 "title": issue.get("title", "Проблема цитирования"),
                 "detail": issue.get("detail", ""),
@@ -299,7 +313,7 @@ def node_audit(state: PipelineState) -> PipelineState:
 {{
   "findings": [
     {{
-      "severity": "clinical|procedural|citation|drug_drug",
+      "category": "clinical|procedural|citation|drug_drug",
       "severity": "high|medium|low",
       "title": "...",
       "detail": "...",
@@ -320,6 +334,22 @@ def node_audit(state: PipelineState) -> PipelineState:
     raw = llm.chat(prompt, system=SYSTEM, temperature=0.05, max_tokens=2400)
     audit = _parse_json(raw)
     llm_findings = list(audit.get("findings") or [])
+    # нормализация: LLM иногда путает category/severity из старой схемы
+    _cats = {"clinical", "procedural", "citation", "drug_drug"}
+    _sevs = {"high", "medium", "low"}
+    for f in llm_findings:
+        if not isinstance(f, dict):
+            continue
+        cat = f.get("category")
+        sev = f.get("severity")
+        if sev in _cats and (cat is None or cat in _sevs):
+            f["category"], f["severity"] = sev, (cat if cat in _sevs else "medium")
+        elif cat in _sevs and sev in _cats:
+            f["category"], f["severity"] = sev, cat
+        if f.get("category") not in _cats:
+            f["category"] = "clinical"
+        if f.get("severity") not in _sevs:
+            f["severity"] = "medium"
 
     # отсекаем типичные ложные срабатывания LLM про «БРА запрещён при ангиоотёке»
     filtered_llm = []
@@ -361,10 +391,18 @@ def node_audit(state: PipelineState) -> PipelineState:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     for f in rule_findings + filtered_llm:
-        key = f.get("rule_id") or f.get("title")
+        title = re.sub(r"\s+", " ", str(f.get("title") or "").lower()).strip()
+        rid = str(f.get("rule_id") or "")
+        # rule_id приоритетнее; иначе нормализованный title (антидубль LLM≈rule)
+        key = rid or title
         if not key or key in seen:
             continue
-        seen.add(str(key))
+        # дополнительный антидубль по смыслу consent
+        if "соглас" in title and any("соглас" in s for s in seen if not s.isupper()):
+            # already have a consent-like finding
+            if any("соглас" in str(x.get("title") or "").lower() for x in merged):
+                continue
+        seen.add(key)
         merged.append(f)
     audit["findings"] = merged
     audit["rule_based_count"] = len(rule_findings)

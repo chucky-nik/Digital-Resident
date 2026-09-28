@@ -16,6 +16,8 @@
    - `replan` — при флаге отклонения (напр. гиперкалиемия) пересчёт тактики снова через RAG;
    - `audit` — LLM-аудитор + **rule-based tools** (`safety.py`: drug–drug, согласие, СКФ/K+).
 3. Разделение **скрипт / LLM** снижает галлюцинации на критичных правилах (иАПФ при ангиоотёке, двойная блокада РААС и т.п.), а LLM остаётся для клинического текста и поиска дефектов.
+4. **Формуляр доз** (`dosing.py`): числовые мг, диапазоны, запрет «начальная доза»; при K+≥5.5 — жёсткий `action=stop` иРААС (не «отмена или снижение»).
+5. **Симуляция чувствительна к терапии**: тяжёлая hyperK на день 3 — только при активном иРААС; при ХБП K+ растёт быстрее на иРААС.
 
 Стек: Python 3.12, LangGraph, Chroma, Streamlit; LLM Neural Deep (`qwen3.8-27b-noreason`) + embeddings `bge-m3`, fallback llm7.
 
@@ -137,6 +139,9 @@ streamlit run app/streamlit_app.py --server.port 8501
 # офлайн: ward 1…N, notes, safety, simulation, citations, импорты (без LLM)
 python scripts/test_regression.py
 
+# клиническое качество: формуляр доз, hard-stop hyperK, golden-классы
+python scripts/test_clinical_quality.py
+
 # живой стресс: 3 кейса × несколько прогонов → data/stress_report.json
 python scripts/stress_cases.py
 ```
@@ -194,9 +199,11 @@ notebooks/demo.ipynb          # демо без API
 scripts/
   build_rag.py | run_case.py
   test_regression.py          # офлайн-регрессия
+  test_clinical_quality.py    # формуляр доз / hyperK / golden
   stress_cases.py             # живой стресс 3 кейсов
 src/digital_resident/
   agents/graph.py             # LangGraph: rag→plan→simulate→replan→audit
+  dosing.py                   # формуляр мг + hard-stop hyperK
   rag/ | safety.py | simulation.py | citations.py | patients.py | cases.py | jobs.py
 data/
   guidelines/                 # PDF КР, txt, chunks.json
