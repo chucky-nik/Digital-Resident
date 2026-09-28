@@ -179,6 +179,52 @@ def test_safety() -> None:
     check("enforce убирает ACEI при ангиоотёке", not clas["acei"], str(clas))
 
 
+def test_dosing_guardrails() -> None:
+    """Критичный слой: dosing.py ловит вредные/пустые дозы и hard-stop hyperK."""
+    section("Dosing guardrails")
+    from digital_resident.dosing import (
+        enforce_iraas_stop_on_hyperkalemia,
+        is_stop_action,
+        is_vague_dose,
+        repair_medication_dose,
+        validate_medication_dose,
+    )
+    from digital_resident.rag import GuidelineRAG
+
+    rag = GuidelineRAG()
+    check("GuidelineRAG.count is int", isinstance(rag.count, int), str(type(rag.count)))
+
+    bad = {"name": "Эналаприл", "dose": "100 мг"}
+    findings = validate_medication_dose(bad, egfr=60)
+    check(
+        "OVERDOSE эналаприл 100 мг → DOSE_OUT_OF_RANGE",
+        any(f.get("rule_id") == "DOSE_OUT_OF_RANGE" for f in findings),
+        str([f.get("rule_id") for f in findings]),
+    )
+    fixed = repair_medication_dose(bad, egfr=60)
+    check("repair clamps to safe start", "мг" in str(fixed.get("dose")), str(fixed.get("dose")))
+
+    check("vague «начальная доза»", is_vague_dose("Начальная доза"))
+    check("hedge «отмена или снижение»", is_vague_dose("отмена или снижение дозы"))
+
+    plan = {
+        "medications": [
+            {"name": "Периндоприл", "dose": "отмена или снижение", "action": "reduce"},
+            {"name": "Амлодипин", "dose": "5 мг"},
+        ]
+    }
+    traj = [
+        {
+            "day": 3,
+            "labs": {"k_mmol_l": 5.7, "egfr": 34},
+            "flags": ["hyperkalemia", "recalculate_plan"],
+        }
+    ]
+    out = enforce_iraas_stop_on_hyperkalemia(plan, traj)
+    peri = next(m for m in out["medications"] if "периндоприл" in str(m.get("name")).lower())
+    check("hyperK hard-stop (не hedge)", is_stop_action(peri) and "или" not in str(peri.get("dose")).lower(), peri)
+
+
 def test_simulation_scenarios() -> None:
     section("Simulation scenarios")
     from digital_resident.simulation import simulate_trajectory, needs_replan
@@ -272,6 +318,7 @@ def main() -> int:
         test_ward_days,
         test_notes_sync,
         test_safety,
+        test_dosing_guardrails,
         test_simulation_scenarios,
         test_citations,
         test_rag_integration,

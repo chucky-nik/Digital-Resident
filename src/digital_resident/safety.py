@@ -386,10 +386,10 @@ def run_safety_checks(
     uniq: list[dict[str, Any]] = []
     seen: set[str] = set()
     for f in findings:
-        key = f"{f.get('rule_id') or f.get('title')}|{f.get('detail', '')[:80]}"
+        key = f"{f.get('rule_id') or f.get('title') or 'UNKNOWN'}|{f.get('detail', '')[:80]}"
         if key in seen:
             continue
-        seen.add(str(key))
+        seen.add(key)
         uniq.append(f)
     return uniq
 
