@@ -100,7 +100,7 @@ def normalize_patient(raw: dict[str, Any]) -> dict[str, Any]:
     exams = raw.get("examinations") or raw.get("exams") or []
     notes_list = raw.get("health_notes") or []
     if isinstance(raw.get("notes"), str) and raw["notes"] and not notes_list:
-        notes_list = [{"date": "day0", "text": raw["notes"]}]
+        notes_list = [{"date": "day1", "text": raw["notes"]}]
 
     pid = raw.get("synthetic_id") or f"SYN-AG-{uuid4().hex[:6].upper()}"
     patient = {
@@ -144,32 +144,276 @@ def normalize_patient(raw: dict[str, Any]) -> dict[str, Any]:
         # Миграция со старого шага «через день» → каждый день
         if _ward_needs_daily_upgrade(patient["ward_history"], patient["ward_stay_days"]):
             patient["ward_history"] = build_ward_history(patient)
+    # day0 в шапке + синхронизация с колонкой «Заметки» стационара
+    return sync_state_notes(patient)
+
+
+_WARD_DAY_NOTE_RE = re.compile(r"^day(-?\d+)$", re.IGNORECASE)
+_AUTO_WARD_NOTE_STARTS = (
+    # устаревшие шаблоны средних дней (до раздельной логики осмотр/заметки)
+    "Коррекция доз по АД",
+    "Продолжаем стационарный режим",
+    "План амбулаторного продолжения терапии",
+)
+# устаревшие/путающие преданамнезные шаблоны
+_DROP_NOTE_TEXT_SUBSTR = (
+    "кофе 3 чашки",
+    "соль не ограничивает, кофе",
+)
+# day-30 с головными болями — старый сид; переносим на day-7
+_REMAP_NOTE_DATES = {
+    ("day-30", "головные боли по утрам"): "day-7",
+}
+
+
+def ward_day_note_date(day: int) -> str:
+    return f"day{int(day)}"
+
+
+def is_ward_day_note_date(date_str: str) -> bool:
+    """True для дней стационара day1..dayN (не преданамнез day-7 и не устаревший day0)."""
+    m = _WARD_DAY_NOTE_RE.match(str(date_str or "").strip())
+    if not m:
+        return False
+    return int(m.group(1)) >= 1
+
+
+def _parse_note_day(date_str: str) -> int | None:
+    m = _WARD_DAY_NOTE_RE.match(str(date_str or "").strip())
+    return int(m.group(1)) if m else None
+
+
+def _normalize_note_date(date_str: str) -> str:
+    """Канон даты: day0→day1; day07→day7; одна метка на сутки."""
+    d = str(date_str or "").strip() or "day1"
+    if d.lower() == "day0":
+        return "day1"
+    n = _parse_note_day(d)
+    if n is not None:
+        return f"day{n}"
+    return d
+
+
+def _note_sort_key(date_str: str) -> tuple:
+    """Сортировка от меньшего дня к большему: day-30 < day-14 < day1 < day14."""
+    n = _parse_note_day(date_str)
+    if n is not None:
+        return (0, n)
+    return (1, str(date_str or "").lower())
+
+
+def format_note_day_label(date_str: str, *, stay_days: int | None = None) -> str:
+    """Метка суток для UI: номер = день таблицы (без слова «День» в осмотре/заметках)."""
+    raw = _normalize_note_date(str(date_str or "").strip())
+    n = _parse_note_day(raw)
+    if n is None:
+        return raw or "—"
+    stay = int(stay_days) if stay_days else None
+    if n == 1:
+        return "1 · поступление"
+    if stay is not None and n >= stay:
+        return f"{n} · выписка"
+    return str(n)
+
+
+def _is_auto_ward_note(text: str) -> bool:
+    t = str(text or "").strip()
+    return any(t.startswith(p) for p in _AUTO_WARD_NOTE_STARTS)
+
+
+def _is_plan_ward_note(text: str) -> bool:
+    t = str(text or "").strip()
+    return t.startswith("Госпитализация на") or t.startswith("Выписка.")
+
+
+def _clinical_admission_from_seed(synthetic_id: str) -> str:
+    """Клиническая заметка поступления из DEMO_SEED (day1 / устаревший day0)."""
+    sid = str(synthetic_id or "").strip()
+    if not sid:
+        return ""
+    seed = next((p for p in DEMO_SEED if p.get("synthetic_id") == sid), None)
+    if not seed:
+        return ""
+    parts: list[str] = []
+    for n in seed.get("health_notes") or []:
+        if not isinstance(n, dict):
+            continue
+        if _normalize_note_date(str(n.get("date") or "")) != "day1":
+            continue
+        t = str(n.get("text") or "").strip()
+        if t and not _is_plan_ward_note(t):
+            parts.append(t)
+    return " ".join(parts)
+
+
+def _should_drop_note_text(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(s in low for s in _DROP_NOTE_TEXT_SUBSTR)
+
+def scrub_auto_ward_notes(patient: dict[str, Any]) -> dict[str, Any]:
+    """Убрать только устаревшие шаблонные заметки; актуальные дневные заметки не трогаем."""
+    hist = list(patient.get("ward_history") or [])
+    for e in hist:
+        if _is_auto_ward_note(str(e.get("notes") or "")):
+            e["notes"] = ""
+    patient["ward_history"] = hist
     return patient
 
 
-WARD_DAYS = tuple(range(0, 15))  # 0..14 включительно, каждый день
+def dedupe_sort_health_notes(notes: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Одна запись на сутки (последний текст побеждает), сортировка по дню ↑."""
+    by_date: dict[str, str] = {}
+    for n in notes or []:
+        if not isinstance(n, dict):
+            continue
+        text = str(n.get("text") or "").strip()
+        date = _normalize_note_date(str(n.get("date") or "").strip() or "day1")
+        if not text or _should_drop_note_text(text):
+            continue
+        low = text.lower()
+        for (d0, needle), d1 in _REMAP_NOTE_DATES.items():
+            if date.lower() == d0 and needle in low:
+                date = d1
+                break
+        # не склеиваем — обновление дня перезаписывает заметку
+        by_date[date] = text
+    return [
+        {"date": d, "text": by_date[d]}
+        for d in sorted(by_date.keys(), key=_note_sort_key)
+    ]
+
+
+def sync_health_notes_from_ward(patient: dict[str, Any]) -> dict[str, Any]:
+    """Собрать health_notes только из стационара (day1..N) + клиническая day1.
+
+    Преданамнез day-N (например day-7) в шапку не выносится — день = номер строки таблицы.
+    """
+    patient = scrub_auto_ward_notes(patient)
+    hist = patient.get("ward_history") or []
+    existing = [n for n in (patient.get("health_notes") or []) if isinstance(n, dict)]
+
+    existing_adm = ""
+    for n in existing:
+        text = str(n.get("text") or "").strip()
+        date = _normalize_note_date(str(n.get("date") or "").strip() or "day1")
+        if not text or _should_drop_note_text(text):
+            continue
+        day_n = _parse_note_day(date)
+        # отрицательные «до поступления» отбрасываем
+        if day_n is not None and day_n < 1:
+            continue
+        if date.lower() == "day1":
+            if not _is_plan_ward_note(text) or not existing_adm:
+                if not text.startswith("Жалобы на дискомфорт") and not text.startswith(
+                    "Состояние при поступлении"
+                ):
+                    existing_adm = text
+
+    from_ward: list[dict[str, str]] = []
+    for e in sorted(hist, key=lambda x: int(x.get("day") or 0)):
+        d = int(e.get("day") or 0)
+        text = str(e.get("notes") or "").strip()
+        if not text or _is_auto_ward_note(text):
+            continue
+        if d == 1:
+            # шаблон «Госпитализация…» в таблице не затирает клиническую day1 в шапке
+            if existing_adm and not _is_plan_ward_note(existing_adm):
+                from_ward.append({"date": "day1", "text": existing_adm})
+            elif not _is_plan_ward_note(text):
+                from_ward.append({"date": "day1", "text": text})
+            else:
+                restored = _clinical_admission_from_seed(str(patient.get("synthetic_id") or ""))
+                if restored:
+                    from_ward.append({"date": "day1", "text": restored})
+                else:
+                    from_ward.append({"date": "day1", "text": text})
+            continue
+        from_ward.append({"date": ward_day_note_date(d), "text": text})
+
+    if not any(n["date"].lower() == "day1" for n in from_ward):
+        if existing_adm and not _is_plan_ward_note(existing_adm):
+            from_ward.insert(0, {"date": "day1", "text": existing_adm})
+        else:
+            restored = _clinical_admission_from_seed(str(patient.get("synthetic_id") or ""))
+            if restored:
+                from_ward.insert(0, {"date": "day1", "text": restored})
+
+    patient["health_notes"] = dedupe_sort_health_notes(from_ward)
+    patient["notes"] = "\n".join(n["text"] for n in patient["health_notes"])
+    return patient
+
+
+def ensure_admission_note(patient: dict[str, Any]) -> dict[str, Any]:
+    """Гарантировать заметку дня поступления (day1) в шапке и в ward day1."""
+    default_text = "Поступление в стационар. Первичный осмотр, готов к терапии."
+    notes = [n for n in (patient.get("health_notes") or []) if isinstance(n, dict)]
+    day1 = next(
+        (
+            n
+            for n in notes
+            if _normalize_note_date(str(n.get("date") or "")) == "day1"
+        ),
+        None,
+    )
+    day1_text = str((day1 or {}).get("text") or "").strip()
+    if not day1_text or _is_plan_ward_note(day1_text):
+        day1_text = (
+            _clinical_admission_from_seed(str(patient.get("synthetic_id") or "")) or default_text
+        )
+    notes = [
+        n
+        for n in notes
+        if _normalize_note_date(str(n.get("date") or "")) != "day1"
+    ]
+    # day1 держим первым среди стационарных; преданамнез выше по списку оставим как был
+    insert_at = 0
+    for i, n in enumerate(notes):
+        if is_ward_day_note_date(str(n.get("date") or "")):
+            insert_at = i
+            break
+        insert_at = i + 1
+    notes.insert(insert_at, {"date": "day1", "text": day1_text})
+    patient["health_notes"] = notes
+
+    hist = list(patient.get("ward_history") or [])
+    for e in hist:
+        if int(e.get("day") or -1) == 1:
+            ward_note = str(e.get("notes") or "").strip()
+            if not ward_note:
+                # в таблицу — краткая клиническая, если колонка пуста
+                e["notes"] = day1_text
+            elif _is_plan_ward_note(ward_note):
+                pass  # шаблон плана не затирает клиническую day1 в шапке
+            # сгенерированная «Состояние при поступлении…» и ручные заметки
+            # остаются в таблице; шапка держит клиническую day1_text
+            break
+    patient["ward_history"] = hist
+    return patient
+
+
+def sync_state_notes(patient: dict[str, Any]) -> dict[str, Any]:
+    """day1 обязательно + health_notes ↔ ward.notes."""
+    patient = ensure_admission_note(patient)
+    return sync_health_notes_from_ward(patient)
+
+
+WARD_DAYS = tuple(range(1, 15))  # 1..14 включительно, каждый день
 
 
 def ward_days_for_stay(stay_days: int) -> list[int]:
-    """Точки осмотра: каждый день от 0 до stay_days включительно."""
+    """Точки осмотра: каждый день от 1 до stay_days включительно (N суток = N записей)."""
     stay = max(2, min(60, int(stay_days or 14)))
-    return list(range(0, stay + 1))
+    return list(range(1, stay + 1))
 
 
 def _ward_needs_daily_upgrade(history: list[dict[str, Any]], stay_days: int) -> bool:
-    """True, если история со старым шагом «через день» и её нужно пересобрать."""
+    """True, если история не совпадает с 1..N (в т.ч. старый формат 0..N или «через день»)."""
     if not history:
         return True
     stay = max(2, min(60, int(stay_days or 14)))
     days = sorted({int(e.get("day") or 0) for e in history})
-    expected = list(range(0, stay + 1))
-    if days == expected:
-        return False
-    # старый формат: преимущественно чётные дни (+ иногда день выписки)
-    evenish = all((d % 2 == 0) or (d == stay) for d in days)
-    gaps = [days[i + 1] - days[i] for i in range(len(days) - 1)] if len(days) > 1 else []
-    has_skip = any(g >= 2 for g in gaps)
-    return evenish and has_skip
+    expected = list(range(1, stay + 1))
+    return days != expected
 
 
 def _parse_bp_pair(bp: str) -> tuple[float, float]:
@@ -205,13 +449,14 @@ def normalize_ward_entry(raw: dict[str, Any]) -> dict[str, Any]:
 
     day_raw = raw.get("day")
     try:
-        day = int(float(day_raw)) if day_raw is not None and str(day_raw) != "nan" else 0
+        day = int(float(day_raw)) if day_raw is not None and str(day_raw) != "nan" else 1
     except Exception:
-        day = 0
+        day = 1
 
     return {
         "day": day,
-        "label": raw.get("label") or (f"День {day} · поступление" if day == 0 else f"День {day}"),
+        "label": raw.get("label")
+        or (f"День {day} · поступление" if day == 1 else f"День {day}"),
         "bp": str(raw.get("bp") or "140/90"),
         "hr": int(_num(raw.get("hr"), 75)),
         "weight_kg": round(_num(raw.get("weight_kg"), 80), 1),
@@ -227,11 +472,175 @@ def normalize_ward_entry(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _ward_day_texts(
+    *,
+    day: int,
+    stay: int,
+    t: float,
+    scenario: str,
+    name: str,
+    dx: str,
+    comorbid: str,
+    meds: str,
+    sbp: int,
+    dbp: int,
+    hr: int,
+    k: float,
+    egfr: float,
+    cr: float,
+    glu: float,
+    note_arc: str,
+) -> tuple[str, str, str, str]:
+    """Осмотр и заметки — разные тексты; без префиксов «День N» / «Состояние».
+
+    Номер дня берётся из колонки «День» (номер строки), не из текста.
+    Returns: (exam, results, notes, label)
+    """
+    bp = f"{int(sbp)}/{int(dbp)}"
+    # уникальные акценты по суткам, чтобы соседние дни не копировали друг друга
+    exam_focus = [
+        "утренний обход, лёгкие без хрипов",
+        "оценка отёков и диуреза",
+        "переносимость АГТ, ортостаз",
+        "невростатус без очага",
+        "аускультация сердца, тоны ясные",
+        "контроль периферических отёков",
+        "самочувствие на фоне титрации",
+        "проверка дневника АД с пациентом",
+        "подготовка к контрольным анализам",
+        "оценка достижения целевого АД",
+        "обучение самоконтролю перед выпиской",
+        "финальная проверка жалоб",
+    ]
+    note_focus = [
+        "адаптация к режиму, жалобы умеренные",
+        "переносимость схемы удовлетворительная",
+        "головные боли реже, сон лучше",
+        "соль ограничивает, приверженность хорошая",
+        "отёков нет, активность обычная",
+        "АД по дневнику снижается плавно",
+        "понимает схему приёма препаратов",
+        "без новых жалоб, самочувствие ровное",
+        "готовим план амбулаторного контроля",
+        "целевое АД ближе, самочувствие стабильное",
+        "знает, когда обратиться при ухудшении",
+        "готов к выписке, рекомендации понятны",
+    ]
+    fi = (day - 2) % len(exam_focus)
+    ni = (day - 2) % len(note_focus)
+
+    if day == 1:
+        exam = (
+            f"Поступление. Первичный осмотр терапевта: {name}. "
+            f"Диагноз: {dx}. Коморбидность: {comorbid}. "
+            f"Объективно: АД {bp}, ЧСС {hr}, отёков нет/минимальные, лёгкие без хрипов."
+        )
+        results = (
+            f"Лаборатория при поступлении: K+ {k}, рСКФ {egfr}, креатинин {cr}, глюкоза {glu}. "
+            f"ЭКГ: синусовый ритм. Исходные препараты: {meds}."
+        )
+        notes = (
+            f"Жалобы на дискомфорт/цефалгию. "
+            f"Госпитализация на {stay} сут, старт титрации АГТ. {note_arc}"
+        )
+        return exam, results, notes, "День 1 · поступление"
+
+    if day >= stay:
+        exam = (
+            f"Осмотр перед выпиской: состояние стабильное, "
+            f"АД {bp}, ЧСС {hr}. Рекомендации и лист назначений выданы."
+        )
+        results = (
+            f"Итоговые показатели: АД {bp}, ЧСС {hr}, K+ {k}, рСКФ {egfr}, "
+            f"креатинин {cr}, глюкоза {glu}. Амбулаторный контроль через 7–14 дней."
+        )
+        notes = (
+            "К выписке удовлетворительное. "
+            "Продолжить назначенную схему, самоконтроль АД, мониторинг K+/рСКФ."
+        )
+        return exam, results, notes, f"День {day} · выписка"
+
+    if scenario == "hyperkalemia_day3" and day == 3:
+        exam = (
+            f"Обход: нарастание слабости, парестезии неяркие. "
+            f"АД {bp}, ЧСС {hr}. Акцент на электролиты и рСКФ."
+        )
+        results = (
+            f"Тревожные labs: K+ {k}, рСКФ {egfr}, креатинин {cr}. "
+            "Показан пересмотр иРААС / коррекция доз."
+        )
+        notes = (
+            f"Ухудшение на фоне роста K+ ({k}). "
+            "Предупреждён о симптомах гиперкалиемии, усилен мониторинг."
+        )
+        return exam, results, notes, f"День {day}"
+
+    if scenario == "hyperkalemia_day3" and day > 3:
+        exam = (
+            f"После коррекции схемы: {exam_focus[fi]}. АД {bp}, ЧСС {hr}, отёков нет."
+        )
+        results = f"Контроль: K+ {k}, рСКФ {egfr}, креатинин {cr}. Тенденция к стабилизации."
+        notes = (
+            f"{note_focus[ni].capitalize()}. "
+            f"После коррекции иРААС АД по дневнику около {bp}."
+        )
+        return exam, results, notes, f"День {day}"
+
+    if scenario == "comorbid_ckd":
+        exam = (
+            f"Обход (ХБП): {exam_focus[fi]}. АД {bp}, ЧСС {hr}."
+        )
+        if t < 0.35:
+            results = f"Контроль нефробезопасности: K+ {k}, рСКФ {egfr}, креатинин {cr}."
+            notes = (
+                f"{note_focus[ni].capitalize()}. "
+                f"Обучен самоконтролю АД; акцент на K+/рСКФ. АД {bp}. {note_arc}"
+            )
+        elif t < 0.65:
+            results = f"СМАД/дневник: снижение АД. Labs: K+ {k}, рСКФ {egfr}."
+            notes = (
+                f"{note_focus[ni].capitalize()}. "
+                f"Соблюдает ограничение соли, отёки не нарастают. АД ~{bp}."
+            )
+        else:
+            results = f"Контроль: K+ {k}, креатинин {cr}, рСКФ {egfr}, глюкоза {glu}."
+            notes = (
+                f"{note_focus[ni].capitalize()}. "
+                f"Понимает схему и контрольные точки K+/рСКФ. АД сегодня {bp}."
+            )
+        return exam, results, notes, f"День {day}"
+
+    # baseline
+    exam = f"{exam_focus[fi].capitalize()}. АД {bp}, ЧСС {hr}."
+    if t < 0.35:
+        results = (
+            f"Ежедневный контроль АД/ЧСС. Labs: K+ {k}, рСКФ {egfr}. "
+            "ЭКГ/ЭхоКГ по показаниям."
+        )
+        notes = (
+            f"{note_focus[ni].capitalize()}. "
+            f"Фиксированная комбинация; АД на обходе {bp}. {note_arc}"
+        )
+    elif t < 0.65:
+        results = f"Дневник АД — тенденция к снижению. Labs: K+ {k}, рСКФ {egfr}."
+        notes = (
+            f"{note_focus[ni].capitalize()}. "
+            f"Приверженность терапии хорошая; АД ~{bp}."
+        )
+    else:
+        results = f"Контрольные анализы: K+ {k}, креатинин {cr}, рСКФ {egfr}, глюкоза {glu}."
+        notes = (
+            f"{note_focus[ni].capitalize()}. "
+            f"Знает целевое АД и план амбулаторного контроля. АД {bp}."
+        )
+    return exam, results, notes, f"День {day}"
+
+
 def build_ward_history(
     patient: dict[str, Any],
     stay_days: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Синтетическая стационарная динамика: N суток, осмотр и результаты каждый день."""
+    """Синтетическая стационарная динамика: N суток; осмотр и заметки различны каждый день."""
     stay = int(stay_days if stay_days is not None else (patient.get("ward_stay_days") or 14))
     stay = max(2, min(60, stay))
     days = ward_days_for_stay(stay)
@@ -252,7 +661,7 @@ def build_ward_history(
 
     history: list[dict[str, Any]] = []
     for day in days:
-        t = day / float(stay)  # 0..1
+        t = (day - 1) / float(max(1, stay - 1))
         if scenario == "comorbid_ckd":
             sbp = round(sbp0 - 18 * t)
             dbp = round(dbp0 - 8 * t)
@@ -269,54 +678,37 @@ def build_ward_history(
             k = round(min(5.9, k0 + bump), 2)
             egfr = round(egfr0 - (12 if day >= early else 0) - 4 * t, 1)
             cr = round(cr0 + (25 if day >= early else 0) + 6 * t, 1)
-            note_arc = "Ранний период: риск гиперкалиемии — коррекция иРААС при росте K+."
+            note_arc = "Риск гиперкалиемии — коррекция иРААС при росте K+."
         else:
             sbp = round(sbp0 - 22 * t)
             dbp = round(dbp0 - 10 * t)
             k = round(k0 + 0.05 * t, 2)
             egfr = round(egfr0 - 1 * t, 1)
             cr = round(cr0 + 2 * t, 1)
-            note_arc = "Типичное течение: фиксированная комбинация, целевое АД."
+            note_arc = "Фиксированная комбинация, целевое АД."
 
         hr = max(58, round(hr0 - 6 * t + (2 if day % 4 == 0 else 0)))
         weight = round(w0 - 0.4 * t, 1)
         glu = round(glu0 - 0.2 * t, 1)
 
-        if day == 0:
-            exam = (
-                f"Поступление в стационар. Осмотр терапевта: {name}. "
-                f"Диагноз: {dx}. Коморбидность: {comorbid}. "
-                f"Жалобы на головную боль/дискомфорт. АД {int(sbp)}/{int(dbp)}, ЧСС {hr}."
-            )
-            results = (
-                f"ОАК, биохимия при поступлении: K+ {k}, рСКФ {egfr}, креатинин {cr}, глюкоза {glu}. "
-                f"ЭКГ: синусовый ритм. Текущие препараты: {meds}."
-            )
-            notes = f"Госпитализация на {stay} суток. План: титрация АГТ, ежедневный мониторинг. {note_arc}"
-            label = "День 0 · поступление"
-        elif day >= stay:
-            exam = f"День {day} — выписка. Состояние удовлетворительное. Рекомендации выданы."
-            results = (
-                f"Итог: АД {int(sbp)}/{int(dbp)}, ЧСС {hr}, K+ {k}, рСКФ {egfr}, креатинин {cr}. "
-                "Амбулаторный контроль через 7–14 дней."
-            )
-            notes = "Выписка. Продолжить назначенную схему, мониторинг K+/рСКФ."
-            label = f"День {day} · выписка"
-        elif t < 0.35:
-            exam = "Утренний обход. Самочувствие удовлетворительное. Отёков нет / минимальные. Аускультация лёгких без хрипов."
-            results = f"Ежедневный контроль АД/ЧСС; K+ {k}, рСКФ {egfr}. ЭхоКГ по показаниям / повторная ЭКГ."
-            notes = f"Коррекция доз по АД. {note_arc}"
-            label = f"День {day}"
-        elif t < 0.65:
-            exam = "Середина курса. Жалобы уменьшились. Неврологический статус без очага."
-            results = f"СМАД/дневник АД: тенденция к снижению. Labs: K+ {k}, рСКФ {egfr}."
-            notes = "Продолжаем стационарный режим, обучение самоконтролю АД."
-            label = f"День {day}"
-        else:
-            exam = "Осмотр перед выпиской. Целевое АД приближается. Самочувствие стабильное."
-            results = f"Контрольные анализы: K+ {k}, креатинин {cr}, рСКФ {egfr}, глюкоза {glu}."
-            notes = "План амбулаторного продолжения терапии."
-            label = f"День {day}"
+        exam, results, notes, label = _ward_day_texts(
+            day=day,
+            stay=stay,
+            t=t,
+            scenario=scenario,
+            name=name,
+            dx=dx,
+            comorbid=comorbid,
+            meds=meds,
+            sbp=int(sbp),
+            dbp=int(dbp),
+            hr=int(hr),
+            k=k,
+            egfr=egfr,
+            cr=cr,
+            glu=glu,
+            note_arc=note_arc,
+        )
         history.append(
             normalize_ward_entry(
                 {
@@ -387,7 +779,7 @@ def rows_to_ward_history(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if _blank(day_val) and not has_content:
             continue
         if _blank(day_val):
-            day_val = 0
+            day_val = 1
         out.append(
             normalize_ward_entry(
                 {
@@ -446,10 +838,14 @@ DEMO_SEED: list[dict[str, Any]] = [
             {"name": "СМАД", "result": "Среднее дневное 154/96", "date": "day-7"},
         ],
         "health_notes": [
-            {"date": "day-30", "text": "Головные боли по утрам 2–3 раза в неделю."},
-            {"date": "day-14", "text": "Соль не ограничивает, кофе 3 чашки/сут."},
-            {"date": "day0", "text": "Первичный приём. Курение отрицает. Готов к терапии."},
-            {"date": "day0", "text": "Семейный анамнез: отец — ИМ в 60 лет."},
+            {
+                "date": "day1",
+                "text": (
+                    "Поступление. Курение отрицает. Готов к терапии. "
+                    "Ранее головные боли по утрам 2–3 раза в неделю. "
+                    "Семейный анамнез: отец — ИМ в 60 лет."
+                ),
+            },
         ],
         "consent_invasive": True,
         "scenario": "baseline",
@@ -488,8 +884,8 @@ DEMO_SEED: list[dict[str, Any]] = [
             {"date": "day-60", "text": "Отёк лица на эналаприл 2 года назад — повторно не назначать иАПФ."},
             {"date": "day-20", "text": "Отёки голеней к вечеру, диурез сохранён."},
             {"date": "day-5", "text": "Нефролог: рСКФ 38, целевое АД <140/80 затем к 130."},
-            {"date": "day0", "text": "Согласие на инвазивные процедуры НЕ подписано."},
-            {"date": "day0", "text": "Жалобы: слабость, шум в ушах при АД >170."},
+            {"date": "day1", "text": "Согласие на инвазивные процедуры НЕ подписано."},
+            {"date": "day1", "text": "Жалобы: слабость, шум в ушах при АД >170."},
         ],
         "consent_invasive": False,
         "scenario": "comorbid_ckd",
@@ -525,8 +921,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         ],
         "health_notes": [
             {"date": "day-14", "text": "ИМТ 28.4, одышка при нагрузке."},
-            {"date": "day0", "text": "Планируется старт двойной терапии; риск гиперкалиемии."},
-            {"date": "day0", "text": "Симуляция: на день 3 ожидается осложнение (рост K+)."},
+            {"date": "day1", "text": "Планируется старт двойной терапии; риск гиперкалиемии."},
+            {"date": "day1", "text": "Симуляция: на день 3 ожидается осложнение (рост K+)."},
         ],
         "consent_invasive": True,
         "scenario": "hyperkalemia_day3",
@@ -562,8 +958,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         "health_notes": [
             {"date": "day-21", "text": "Стресс на работе, АД повышается к вечеру."},
             {"date": "day-7", "text": "Ограничила соль, АД чуть снизилось."},
-            {"date": "day0", "text": "Хочет начать терапию с минимальных доз."},
-            {"date": "day0", "text": "Беременность исключена, контрацепция."},
+            {"date": "day1", "text": "Хочет начать терапию с минимальных доз."},
+            {"date": "day1", "text": "Беременность исключена, контрацепция."},
         ],
         "consent_invasive": True,
         "scenario": "baseline",
@@ -598,8 +994,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         "health_notes": [
             {"date": "day-40", "text": "Приступы стенокардии при ходьбе >300 м."},
             {"date": "day-10", "text": "Кардиолог: добавить иРААС, контроль K+."},
-            {"date": "day0", "text": "Отёков нет, одышка при нагрузке."},
-            {"date": "day0", "text": "Приверженность к статину хорошая."},
+            {"date": "day1", "text": "Отёков нет, одышка при нагрузке."},
+            {"date": "day1", "text": "Приверженность к статину хорошая."},
         ],
         "consent_invasive": True,
         "scenario": "comorbid_ckd",
@@ -632,8 +1028,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         "health_notes": [
             {"date": "day-30", "text": "Непереносимость НПВП/аспирина — бронхоспазм."},
             {"date": "day-12", "text": "Пульмонолог: ББ неселективные нежелательны."},
-            {"date": "day0", "text": "Предпочтительны иРААС + АК; избегать неселективных ББ."},
-            {"date": "day0", "text": "Обострений астмы за 6 мес не было."},
+            {"date": "day1", "text": "Предпочтительны иРААС + АК; избегать неселективных ББ."},
+            {"date": "day1", "text": "Обострений астмы за 6 мес не было."},
         ],
         "consent_invasive": True,
         "scenario": "baseline",
@@ -667,8 +1063,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         "health_notes": [
             {"date": "day-45", "text": "АД не достигает цели на тройной комбинации."},
             {"date": "day-15", "text": "Рассматривали спиронолактон — риск гиперкалиемии при СКФ 36."},
-            {"date": "day0", "text": "Соль не ограничивает, ИМТ 29."},
-            {"date": "day0", "text": "Нужен тщательный мониторинг K+/СКФ при усилении терапии."},
+            {"date": "day1", "text": "Соль не ограничивает, ИМТ 29."},
+            {"date": "day1", "text": "Нужен тщательный мониторинг K+/СКФ при усилении терапии."},
         ],
         "consent_invasive": True,
         "scenario": "comorbid_ckd",
@@ -701,8 +1097,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         "health_notes": [
             {"date": "day-90", "text": "Обострение язвы год назад на фоне НПВП."},
             {"date": "day-20", "text": "Избегать НПВП; АГТ стандартная допустима."},
-            {"date": "day0", "text": "Жалобы: тяжесть в эпигастрии при стрессе."},
-            {"date": "day0", "text": "Согласие на инвазивные подписано."},
+            {"date": "day1", "text": "Жалобы: тяжесть в эпигастрии при стрессе."},
+            {"date": "day1", "text": "Согласие на инвазивные подписано."},
         ],
         "consent_invasive": True,
         "scenario": "baseline",
@@ -735,8 +1131,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         "health_notes": [
             {"date": "day-60", "text": "Кашель на лизиноприл — смена класса на БРА под контролем."},
             {"date": "day-14", "text": "рСКФ 28 — тиазиды противопоказаны."},
-            {"date": "day0", "text": "K+=5.0 — на старте иРААС высокий риск."},
-            {"date": "day0", "text": "Согласие на инвазивные НЕ оформлено."},
+            {"date": "day1", "text": "K+=5.0 — на старте иРААС высокий риск."},
+            {"date": "day1", "text": "Согласие на инвазивные НЕ оформлено."},
         ],
         "consent_invasive": False,
         "scenario": "comorbid_ckd",
@@ -770,8 +1166,8 @@ DEMO_SEED: list[dict[str, Any]] = [
         "health_notes": [
             {"date": "day-25", "text": "Храп, дневная сонливость."},
             {"date": "day-10", "text": "Диетолог: цель −5–10% массы тела."},
-            {"date": "day0", "text": "Готова к старту фиксированной комбинации."},
-            {"date": "day0", "text": "Просит объяснить целевое АД и мониторинг."},
+            {"date": "day1", "text": "Готова к старту фиксированной комбинации."},
+            {"date": "day1", "text": "Просит объяснить целевое АД и мониторинг."},
         ],
         "consent_invasive": True,
         "scenario": "baseline",
@@ -823,7 +1219,21 @@ def load_cohort() -> list[dict[str, Any]]:
         norm = normalize_patient(raw)
         raw_days = [int(e.get("day") or 0) for e in (raw.get("ward_history") or [])]
         new_days = [int(e.get("day") or 0) for e in (norm.get("ward_history") or [])]
-        if not (raw.get("ward_history") or []) or raw_days != new_days:
+        raw_notes = [
+            (str(n.get("date") or ""), str(n.get("text") or ""))
+            for n in (raw.get("health_notes") or [])
+            if isinstance(n, dict)
+        ]
+        new_notes = [
+            (str(n.get("date") or ""), str(n.get("text") or ""))
+            for n in (norm.get("health_notes") or [])
+            if isinstance(n, dict)
+        ]
+        if (
+            not (raw.get("ward_history") or [])
+            or raw_days != new_days
+            or raw_notes != new_notes
+        ):
             dirty = True
         cohort.append(norm)
     if dirty or len(data) != len(cohort):

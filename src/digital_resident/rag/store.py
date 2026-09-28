@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 
-from digital_resident.config import settings
+from digital_resident.config import has_llm_api_key, settings
 from digital_resident.llm import get_llm
 from digital_resident.rag.chunker import load_or_build_chunks, save_chunks
 
@@ -30,30 +31,62 @@ class GuidelineRAG:
     def count(self) -> int:
         return self.collection.count()
 
-    def _all_chunks(self) -> list[dict[str, Any]]:
-        if self._cache is not None:
-            return self._cache
-        if self.count == 0:
+    def _chunks_from_json(self) -> list[dict[str, Any]]:
+        path = settings()["chunks_json"]
+        if not path.exists():
             return []
-        raw = self.collection.get(include=["documents", "metadatas"])
+        raw = json.loads(path.read_text(encoding="utf-8"))
         out = []
-        for i, cid in enumerate(raw["ids"]):
-            meta = (raw["metadatas"] or [{}])[i] or {}
+        for c in raw:
+            cid = c.get("id") or c.get("chunk_id") or ""
+            if not cid:
+                continue
             out.append(
                 {
                     "chunk_id": cid,
                     "id": cid,
-                    "text": (raw["documents"] or [""])[i] or "",
-                    "section": meta.get("section", ""),
-                    "page": meta.get("page", ""),
-                    "source": meta.get("source", ""),
-                    "citation": f"{meta.get('section', 'КР')} (стр. {meta.get('page', '?')})",
+                    "text": c.get("text") or "",
+                    "section": c.get("section", ""),
+                    "page": c.get("page", ""),
+                    "source": c.get("source", ""),
+                    "citation": f"{c.get('section', 'КР')} (стр. {c.get('page', '?')})",
                 }
             )
-        self._cache = out
         return out
 
+    def _all_chunks(self) -> list[dict[str, Any]]:
+        if self._cache is not None:
+            return self._cache
+        if self.count > 0:
+            raw = self.collection.get(include=["documents", "metadatas"])
+            out = []
+            for i, cid in enumerate(raw["ids"]):
+                meta = (raw["metadatas"] or [{}])[i] or {}
+                out.append(
+                    {
+                        "chunk_id": cid,
+                        "id": cid,
+                        "text": (raw["documents"] or [""])[i] or "",
+                        "section": meta.get("section", ""),
+                        "page": meta.get("page", ""),
+                        "source": meta.get("source", ""),
+                        "citation": f"{meta.get('section', 'КР')} (стр. {meta.get('page', '?')})",
+                    }
+                )
+            self._cache = out
+            return out
+        # без Chroma / без API — keyword-RAG по сохранённым chunks.json
+        self._cache = self._chunks_from_json()
+        return self._cache
+
     def build(self, force: bool = False) -> int:
+        if not has_llm_api_key():
+            # офлайн: только убеждаемся, что есть chunks.json
+            chunks = self._chunks_from_json() or load_or_build_chunks(include_full_text=True)
+            if not self._chunks_from_json():
+                save_chunks(chunks)
+                self._cache = None
+            return len(self._all_chunks())
         if self.count > 0 and not force:
             return self.count
         if force and self.count > 0:
@@ -90,6 +123,8 @@ class GuidelineRAG:
         return self.count
 
     def _vector_search(self, query: str, k: int) -> list[dict[str, Any]]:
+        if not has_llm_api_key() or self.count == 0:
+            return []
         emb = get_llm().embed([query])[0]
         res = self.collection.query(
             query_embeddings=[emb],
@@ -161,9 +196,10 @@ class GuidelineRAG:
         *,
         must_include_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        if self.count == 0:
+        if self.count == 0 and not self._all_chunks():
             self.build()
-        vector = self._vector_search(query, k=max(k, 8))
+        # без API — только keyword (+ must_include); с API — hybrid vector+keyword
+        vector = self._vector_search(query, k=max(k, 8)) if has_llm_api_key() else []
         keyword = self._keyword_search(query, k=max(k, 8))
 
         merged: dict[str, dict[str, Any]] = {}

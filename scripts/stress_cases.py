@@ -29,10 +29,10 @@ def check_result(case_id: str, result: dict) -> list[str]:
         errs.append(f"citation_issues={len(result['citation_issues'])}")
     traj = result.get("trajectory") or []
     stay = int((result.get("patient") or {}).get("ward_stay_days") or 14)
-    expected_days = list(range(0, stay + 1))
+    expected_days = list(range(1, stay + 1))
     got_days = [t.get("day") for t in traj]
     if got_days != expected_days:
-        errs.append(f"bad trajectory days {got_days[:5]}… (expected daily 0..{stay})")
+        errs.append(f"bad trajectory days {got_days[:5]}… (expected daily 1..{stay})")
     audit = result.get("audit") or {}
     if "findings" not in audit:
         errs.append("no audit findings key")

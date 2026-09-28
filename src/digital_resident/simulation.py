@@ -11,7 +11,7 @@ def simulate_trajectory(
 ) -> list[dict[str, Any]]:
     """Детерминированные контрольные точки (каждый день госпитализации)."""
     stay = max(2, min(60, int(patient.get("ward_stay_days") or 14)))
-    days = days or list(range(0, stay + 1))
+    days = days or list(range(1, stay + 1))
     labs0 = dict(patient.get("labs_day0") or {})
     bp0 = patient.get("bp_office", "150/95")
     try:
@@ -27,13 +27,14 @@ def simulate_trajectory(
         flags: list[str] = []
 
         if scenario == "baseline":
-            # плавное улучшение каждый день
-            sbp = sbp0 - min(d * 2, 28)
-            dbp = dbp0 - min(d, 16)
-            labs["k_mmol_l"] = round(labs0.get("k_mmol_l", 4.2) + 0.02 * d, 2)
+            # плавное улучшение каждый день (день 1 = старт)
+            progress_d = d - 1
+            sbp = sbp0 - min(progress_d * 2, 28)
+            dbp = dbp0 - min(progress_d, 16)
+            labs["k_mmol_l"] = round(labs0.get("k_mmol_l", 4.2) + 0.02 * progress_d, 2)
             labs["creatinine_umol_l"] = labs0.get("creatinine_umol_l", 88) + (1 if d >= 3 else 0) + (1 if d >= 7 else 0)
             labs["egfr"] = max(85, labs0.get("egfr", 92) - (1 if d >= 3 else 0) - (1 if d >= 7 else 0))
-            if d == 0:
+            if d == 1:
                 events.append("Старт терапии по КР (иРААС + АК/диуретик).")
             elif d < 3:
                 events.append("Ежедневный контроль АД; переносимость оценивается.")
@@ -45,12 +46,13 @@ def simulate_trajectory(
                 events.append("Стабилизация на целевых значениях.")
 
         elif scenario == "comorbid_ckd":
-            sbp = sbp0 - min(d * 1.5, 18)
-            dbp = dbp0 - min(0.7 * d, 8)
-            labs["k_mmol_l"] = round(min(5.3, labs0.get("k_mmol_l", 4.9) + 0.04 * d), 2)
+            progress_d = d - 1
+            sbp = sbp0 - min(progress_d * 1.5, 18)
+            dbp = dbp0 - min(0.7 * progress_d, 8)
+            labs["k_mmol_l"] = round(min(5.3, labs0.get("k_mmol_l", 4.9) + 0.04 * progress_d), 2)
             labs["creatinine_umol_l"] = labs0.get("creatinine_umol_l", 148) + max(0, d - 2)
             labs["egfr"] = max(30, labs0.get("egfr", 38) - max(0, (d - 2) // 2))
-            if d == 0:
+            if d == 1:
                 events.append("Учёт ХБП и аллергии на иАПФ при выборе схемы.")
                 flags.append("need_gfr_before_nephrotoxic")
                 flags.append("prefer_arb_over_acei")
@@ -67,8 +69,9 @@ def simulate_trajectory(
 
         elif scenario == "hyperkalemia_day3":
             if d < 3:
-                sbp = sbp0 - d * 2
-                dbp = dbp0 - d
+                progress_d = d - 1
+                sbp = sbp0 - progress_d * 2
+                dbp = dbp0 - progress_d
                 events.append("Старт стандартной комбинации; ежедневный контроль АД и электролитов.")
             elif d == 3:
                 sbp = sbp0 - 8

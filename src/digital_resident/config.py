@@ -27,3 +27,9 @@ def settings() -> dict:
         "chroma_dir": ROOT / "data" / "chroma",
         "collection_name": "kr_ag_2024",
     }
+
+
+def has_llm_api_key() -> bool:
+    """Есть ли ключ для живого LLM / embeddings (не коммитьте ключи в git)."""
+    s = settings()
+    return bool(s["neural_deep_api_key"] or s["llm7_api_key"])

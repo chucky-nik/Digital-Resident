@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from digital_resident.agents import run_case, run_patient
 from digital_resident.cases import get_case, list_cases
+from digital_resident.config import has_llm_api_key
 from digital_resident.jobs import (
     latest_active_job,
     load_job_result,
@@ -23,6 +24,7 @@ from digital_resident.jobs import (
 from digital_resident.patients import (
     build_ward_history,
     delete_patient,
+    format_note_day_label,
     format_sex_ru,
     get_patient,
     is_case_record,
@@ -36,6 +38,7 @@ from digital_resident.patients import (
     upsert_patient,
     ward_history_to_rows,
 )
+from digital_resident.patients import _note_sort_key
 from digital_resident.rag import GuidelineRAG
 
 st.set_page_config(
@@ -91,7 +94,10 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div {
 .mz-topbar h1 { margin:0; font-size:1.1rem; text-transform:uppercase; }
 .mz-topbar .sub { margin:0; font-size:.78rem; opacity:.9; }
 .mz-emblem { width:42px; height:42px; border:2px solid rgba(255,255,255,.7); border-radius:50%;
-  display:grid; place-items:center; font-weight:700; margin-right:.8rem; }
+  display:grid; place-items:center; font-weight:700; margin-right:.8rem;
+  color:#fff !important; text-decoration:none !important; cursor:pointer;
+  transition: background .15s ease, border-color .15s ease; }
+a.mz-emblem:hover { border-color:#fff; background:rgba(255,255,255,.14); color:#fff !important; }
 .mz-brand { display:flex; align-items:center; }
 .mz-panel { background:#fff; border:1px solid var(--mz-border); padding:1rem 1.1rem; margin-bottom:1rem; border-radius:0; }
 .mz-panel h3 { margin:0 0 .7rem; font-size:1rem; color:var(--mz-blue-dark); border-bottom:2px solid var(--mz-blue);
@@ -115,11 +121,37 @@ section[data-testid="stSidebar"][aria-expanded="false"] > div {
 .mz-banner strong { display:block; margin-bottom:.15rem; }
 .mz-banner span { display:block; opacity:.92; font-size:.9rem; }
 .mz-note { border-left:3px solid var(--mz-blue-action); padding:.35rem .6rem; margin:.25rem 0; background:#F8FBFF; font-size:.88rem; }
+.mz-note .mz-day-tag {
+  display:inline-block; min-width:7.5rem; margin-right:.35rem;
+  font-weight:700; color:var(--mz-blue-dark); white-space:nowrap;
+}
+.mz-note .mz-day-num {
+  display:inline-block; min-width:2.2rem; text-align:center;
+  margin-right:.5rem; padding:.05rem .35rem;
+  border:1px solid var(--mz-border); border-radius:3px;
+  background:#fff; color:var(--mz-blue-dark);
+  font-size:.8rem; font-weight:700;
+}
 .mz-footer { margin-top:1.2rem; padding-top:.7rem; border-top:1px solid var(--mz-border); color:var(--mz-muted); font-size:.76rem; }
 section[data-testid="stSidebar"] { background:#fff; border-right:1px solid var(--mz-border); }
 div.stButton > button { border-radius:0 !important; font-weight:700 !important; text-transform:uppercase !important; }
 div.stButton > button[kind="primary"] { background:var(--mz-blue-action) !important; color:#fff !important; }
 .stTabs [aria-selected="true"] { color:var(--mz-blue-dark) !important; border-bottom:3px solid var(--mz-blue) !important; }
+
+/* убрать «Press Enter to submit form» у полей в формах */
+div[data-testid="InputInstructions"],
+[data-testid="stForm"] div[data-testid="InputInstructions"],
+.stTextInput div[data-testid="InputInstructions"],
+.stNumberInput div[data-testid="InputInstructions"],
+.stTextArea div[data-testid="InputInstructions"] {
+  display: none !important;
+  visibility: hidden !important;
+  width: 0 !important;
+  height: 0 !important;
+  overflow: hidden !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
 
 /* убрать иконку «ссылка на заголовок» у h1–h6 */
 div[data-testid="stMarkdownContainer"] a[href^="#"] { display: none !important; }
@@ -148,31 +180,34 @@ div[data-testid="stTextArea"] textarea:focus {
   box-shadow: 0 0 0 2px rgba(47,101,163,0.22) !important;
   outline: none !important;
 }
-/* select / combobox */
-div[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
-div[data-testid="stMultiSelect"] div[data-baseweb="select"] > div {
+/* select / combobox — явная рамка (как у полей ввода) */
+div[data-testid="stSelectbox"],
+div[data-testid="stMultiSelect"] {
   border: 2px solid var(--mz-blue) !important;
   border-radius: 4px !important;
   background: #fff !important;
+  padding: 0 !important;
+  overflow: hidden;
 }
-/* number stepper wrapper */
+div[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+div[data-testid="stMultiSelect"] div[data-baseweb="select"] > div {
+  border: none !important;
+  border-radius: 0 !important;
+  background: #fff !important;
+  box-shadow: none !important;
+  min-height: 2.4rem;
+}
+div[data-testid="stSelectbox"]:focus-within,
+div[data-testid="stMultiSelect"]:focus-within {
+  border-color: var(--mz-blue-dark) !important;
+  box-shadow: 0 0 0 2px rgba(47,101,163,0.22) !important;
+}
+/* number input: без кнопок ± — только ручной ввод */
+div[data-testid="stNumberInput"] button {
+  display: none !important;
+}
 div[data-testid="stNumberInput"] > div {
   border: none !important;
-}
-/* поле Пол — явная подсветка */
-.mz-sex-wrap {
-  border: 2px solid var(--mz-blue);
-  background: #E8F1FB;
-  border-radius: 4px;
-  padding: 0.55rem 0.7rem 0.15rem;
-  margin-bottom: 0.35rem;
-}
-.mz-sex-wrap .mz-sex-tag {
-  display: block;
-  font-weight: 700;
-  color: var(--mz-blue-dark);
-  font-size: 0.88rem;
-  margin-bottom: 0.15rem;
 }
 /* список пациентов */
 .mz-plist-item {
@@ -195,13 +230,41 @@ def inject() -> None:
     st.markdown(MZ_CSS, unsafe_allow_html=True)
     st.markdown(
         """
-        <div class="mz-topbar"><div class="mz-brand"><div class="mz-emblem">МЗ</div>
+        <div class="mz-topbar"><div class="mz-brand">
+        <a class="mz-emblem" href="?home=1" title="На начальную страницу">МЗ</a>
         <div><h1>Цифровой Ординатор</h1>
         <p class="sub">СППР · когорта · форма нового пациента · КР АГ 2024</p></div></div>
         <div style="text-align:right;font-size:.75rem;opacity:.92">Тестовый стенд<br/>синтетические данные</div></div>
         """,
         unsafe_allow_html=True,
     )
+
+
+def go_home_if_requested() -> None:
+    """Клик по «МЗ» → сброс к начальному виду когорты."""
+    try:
+        home = st.query_params.get("home")
+    except Exception:
+        home = None
+    if home != "1":
+        return
+    st.session_state.pop("selected_patient_id", None)
+    st.session_state.pop("focus_patient_id", None)
+    st.session_state["results"] = {}
+    st.session_state["active_main_tab"] = "cohort"
+    # сбросить поиск/выбор в виджетах когорты
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and (
+            k.startswith("search_cohort")
+            or k.startswith("cohort_patient_select")
+            or k.startswith("search_")
+        ):
+            st.session_state.pop(k, None)
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    st.rerun()
 
 
 def init_state() -> None:
@@ -233,13 +296,19 @@ def any_job_running() -> bool:
 
 def ensure_rag() -> None:
     rag = GuidelineRAG()
-    if rag.count == 0:
+    if rag.count == 0 and not rag._all_chunks():
         rag.build()
 
 
 def launch_patient_job(scope: str, label: str, patient: dict) -> None:
     if any_job_running():
         st.warning("Уже выполняется расчёт СППР. Дождитесь завершения.")
+        return
+    if not has_llm_api_key():
+        st.error(
+            "Нет API-ключа в `.env`. Живой СППР недоступен — откройте вкладку "
+            "«Кейсы задания» → «Показать сохранённый результат» или положите ключ в `.env`."
+        )
         return
 
     patient_copy = dict(patient)
@@ -258,6 +327,12 @@ def launch_case_job(scope: str, case_id: str, label: str) -> None:
     if any_job_running():
         st.warning("Уже выполняется расчёт СППР. Дождитесь завершения.")
         return
+    if not has_llm_api_key():
+        st.error(
+            "Нет API-ключа. Используйте кнопку «Показать сохранённый результат» "
+            "или задайте `NEURAL_DEEP_API_KEY` в `.env`."
+        )
+        return
 
     def _target():
         ensure_rag()
@@ -270,6 +345,13 @@ def launch_case_job(scope: str, case_id: str, label: str) -> None:
     st.session_state["active_job_id"] = job_id
     st.session_state["consumed_job_id"] = None
     st.toast(f"Запущен расчёт: {label}", icon="⏳")
+
+
+def load_cached_case_result(case_id: str) -> dict | None:
+    path = ROOT / "data" / f"result_{case_id}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @st.fragment(run_every=2)
@@ -405,13 +487,25 @@ def render_patient_chooser(
 
 def render_patient_card(p: dict, *, key_prefix: str = "card") -> None:
     labs = p.get("labs_day0") or {}
-    notes = p.get("health_notes") or []
-    notes_html = "".join(
-        f'<div class="mz-note"><b>{html.escape(str(n.get("date","")))}</b> — '
-        f'{html.escape(str(n.get("text","")))}</div>'
-        for n in notes
-        if isinstance(n, dict)
-    ) or f'<div class="mz-note">{html.escape(str(p.get("notes", "") or ""))}</div>'
+    hist = p.get("ward_history") or []
+    stay = int(p.get("ward_stay_days") or (hist[-1].get("day") if hist else 14) or 14)
+    notes = [
+        n
+        for n in (p.get("health_notes") or [])
+        if isinstance(n, dict) and str(n.get("text") or "").strip()
+    ]
+    # сверху вниз: day1 → dayN (день = номер строки таблицы)
+    notes = sorted(notes, key=lambda n: _note_sort_key(str(n.get("date") or "")))
+    note_blocks: list[str] = []
+    for n in notes:
+        date_raw = str(n.get("date") or "")
+        label = format_note_day_label(date_raw, stay_days=stay)
+        note_blocks.append(
+            f'<div class="mz-note">'
+            f'<span class="mz-day-tag">{html.escape(label)}</span> — '
+            f'{html.escape(str(n.get("text") or ""))}</div>'
+        )
+    notes_html = "".join(note_blocks) or '<div class="mz-note">Нет заметок</div>'
     exams = p.get("examinations") or []
     exams_html = "".join(
         f"<li><b>{html.escape(str(e.get('name')))}</b> ({html.escape(str(e.get('date','')))}): "
@@ -421,8 +515,7 @@ def render_patient_card(p: dict, *, key_prefix: str = "card") -> None:
     )
     consent = "получено" if p.get("consent_invasive", True) else "НЕ получено"
     ccls = "ok" if p.get("consent_invasive", True) else "high"
-    hist = p.get("ward_history") or []
-    stay = int(p.get("ward_stay_days") or (hist[-1].get("day") if hist else 14) or 14)
+    n_notes = len(notes)
     st.markdown(
         f"""
         <div class="mz-panel"><h3>Пациент {html.escape(str(p.get('full_name')))}</h3>
@@ -437,13 +530,15 @@ def render_patient_card(p: dict, *, key_prefix: str = "card") -> None:
           <div class="k">Согласие</div><div class="v"><span class="mz-badge {ccls}">{consent}</span></div>
           <div class="k">Стационар</div><div class="v">{stay} сут · {len(hist)} точек осмотра</div>
         </div>
-        <div class="mz-h4">Заметки о состоянии</div>{notes_html}
         <div class="mz-h4">Обследования</div>
         <ul>{exams_html or '<li>—</li>'}</ul>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    with st.expander(f"Заметки о состоянии · {n_notes}", expanded=False):
+        st.caption('Дни с заполненной колонкой «Заметки» (текст отличается от «Осмотр»)')
+        st.markdown(notes_html, unsafe_allow_html=True)
     with st.expander(f"Вся история стационара · {len(hist)} записей", expanded=False):
         if not hist:
             if key_prefix == "cases" or is_case_record(p):
@@ -574,46 +669,141 @@ def render_ward_history_editor(
     ed_key = f"ward_ed_{key_prefix}_{pid}"
     flash_key = f"ward_flash_{key_prefix}_{pid}"
     stay_default = int(patient.get("ward_stay_days") or 14)
+    stay_key = f"ward_stay_{key_prefix}_{pid}"
+    applied_key = f"ward_stay_applied_{key_prefix}_{pid}"
+    day_key = f"ward_manual_day_{key_prefix}_{pid}"
+    day_anchor = f"ward_manual_day_anchor_{key_prefix}_{pid}"
+    text_key = f"ward_manual_text_{key_prefix}_{pid}"
+    bump_key = f"ward_stay_bump_{key_prefix}_{pid}"
+    pending_manual_key = f"ward_pending_manual_{key_prefix}_{pid}"
 
     st.markdown("#### Стационарная история — редактор")
     st.caption(
-        "Здесь можно выбрать длительность госпитализации, править АД/лабораторию "
-        "и **самому записать состояние** в колонках «Осмотр», «Результаты», «Заметки». "
-        "Это история пациента (не симуляция СППР)."
+        "Длительность госпитализации, правки АД/лаборатории. "
+        "± добавляет/убирает сутки, сохраняя уже введённые строки."
     )
 
     flash = st.session_state.pop(flash_key, None)
     if flash:
         st.success(flash)
 
-    sc1, sc2, sc3 = st.columns([1, 1, 2])
+    def _merge_extend(old_hist: list[dict], new_stay: int, pending: str) -> list[dict]:
+        """Сохранить старые дни, добавить новые; pending → в последний день."""
+        old_sorted = sorted(
+            [normalize_ward_entry(e) for e in (old_hist or [])],
+            key=lambda x: int(x.get("day") or 0),
+        )
+        old_by = {int(e["day"]): dict(e) for e in old_sorted}
+        fresh = build_ward_history(
+            {**patient, "ward_stay_days": new_stay},
+            stay_days=new_stay,
+        )
+        out: list[dict] = []
+        for e in fresh:
+            d = int(e.get("day") or 0)
+            if d in old_by:
+                kept = dict(old_by[d])
+                kept["day"] = d
+                out.append(normalize_ward_entry(kept))
+            else:
+                out.append(normalize_ward_entry(e))
+        text = (pending or "").strip()
+        if text:
+            for e in out:
+                if int(e.get("day") or 0) == int(new_stay):
+                    e["exam"] = text
+                    e["notes"] = text
+                    e["label"] = f"День {new_stay}"
+                    break
+        return out
+
+    def _shrink_hist(old_hist: list[dict], new_stay: int) -> list[dict]:
+        old_sorted = sorted(
+            [normalize_ward_entry(e) for e in (old_hist or [])],
+            key=lambda x: int(x.get("day") or 0),
+        )
+        kept = [e for e in old_sorted if 1 <= int(e.get("day") or 0) <= new_stay]
+        if len(kept) == new_stay and [int(e["day"]) for e in kept] == list(range(1, new_stay + 1)):
+            return kept
+        fresh = build_ward_history(
+            {**patient, "ward_stay_days": new_stay},
+            stay_days=new_stay,
+        )
+        by = {int(e["day"]): e for e in kept}
+        return [normalize_ward_entry(by.get(int(e["day"]), e)) for e in fresh]
+
+    # ± обрабатываем до виджетов
+    if bump_key in st.session_state:
+        delta = int(st.session_state.pop(bump_key))
+        pending = ""
+        if delta > 0:
+            pending = str(st.session_state.pop(pending_manual_key, "") or "").strip()
+            if not pending:
+                pending = str(st.session_state.get(text_key, "") or "").strip()
+        else:
+            st.session_state.pop(pending_manual_key, None)
+
+        old_hist = list(patient.get("ward_history") or [])
+        old_stay = max(
+            len(old_hist),
+            int(patient.get("ward_stay_days") or stay_default),
+            int(st.session_state.get(applied_key) or stay_default),
+        )
+        new_stay = max(2, min(60, old_stay + delta))
+        if delta > 0:
+            rebuilt = _merge_extend(old_hist, new_stay, pending)
+            msg = f"Добавлен день {new_stay}" + (" · из текста осмотра" if pending else "")
+        else:
+            rebuilt = _shrink_hist(old_hist, new_stay)
+            msg = f"Убран день, осталось {new_stay} сут"
+
+        if allow_save and patient.get("synthetic_id"):
+            upsert_patient(
+                {
+                    **patient,
+                    "ward_stay_days": new_stay,
+                    "ward_history": rebuilt,
+                }
+            )
+        patient["ward_stay_days"] = new_stay
+        patient["ward_history"] = rebuilt
+        st.session_state[stay_key] = new_stay
+        st.session_state[applied_key] = new_stay
+        st.session_state[day_key] = new_stay
+        st.session_state[day_anchor] = new_stay
+        if pending:
+            st.session_state[text_key] = ""
+        st.session_state.pop(ed_key, None)
+        st.session_state[flash_key] = msg
+        st.rerun()
+
+    if applied_key not in st.session_state:
+        st.session_state[applied_key] = stay_default
+    if stay_key not in st.session_state:
+        st.session_state[stay_key] = stay_default
+
+    sc1, sc2 = st.columns([1.4, 1])
     with sc1:
-        stay_key = f"ward_stay_{key_prefix}_{pid}"
-        applied_key = f"ward_stay_applied_{key_prefix}_{pid}"
-        if applied_key not in st.session_state:
-            st.session_state[applied_key] = stay_default
         stay_days = int(
             st.number_input(
                 "Длительность стационара (сут)",
                 min_value=2,
                 max_value=60,
-                value=stay_default,
                 step=1,
                 key=stay_key,
-                help="При смене числа суток таблица пересобирается сразу.",
+                help="Введите число суток вручную — старые строки сохранятся.",
             )
         )
     with sc2:
         st.metric("Точек сейчас", len(patient.get("ward_history") or []))
-    with sc3:
-        st.caption("Осмотр каждый день: например 10 сут → дни 0, 1, 2… 10.")
 
-    # Смена длительности → сразу пересобрать таблицу
     if int(st.session_state.get(applied_key, stay_default)) != stay_days:
-        rebuilt = build_ward_history(
-            {**patient, "ward_stay_days": stay_days},
-            stay_days=stay_days,
-        )
+        old_hist = list(patient.get("ward_history") or [])
+        old_n = len(old_hist)
+        if stay_days > old_n:
+            rebuilt = _merge_extend(old_hist, stay_days, "")
+        else:
+            rebuilt = _shrink_hist(old_hist, stay_days)
         if allow_save and patient.get("synthetic_id"):
             upsert_patient(
                 {
@@ -625,66 +815,15 @@ def render_ward_history_editor(
         patient["ward_stay_days"] = stay_days
         patient["ward_history"] = rebuilt
         st.session_state[applied_key] = stay_days
+        st.session_state[day_key] = stay_days
+        st.session_state[day_anchor] = stay_days
         st.session_state.pop(ed_key, None)
         st.session_state[flash_key] = (
-            f"Длительность {stay_days} сут — история пересобрана ({len(rebuilt)} точек)"
+            f"Длительность {stay_days} сут · {len(rebuilt)} точек (правки сохранены)"
         )
         st.rerun()
 
     hist = patient.get("ward_history") or build_ward_history(patient, stay_days=stay_days)
-
-    def _persist_hist(new_list: list[dict], msg: str) -> None:
-        if allow_save and patient.get("synthetic_id"):
-            last = max((e.get("day") or 0 for e in new_list), default=int(stay_days))
-            upsert_patient(
-                {
-                    **patient,
-                    "ward_stay_days": max(int(stay_days), int(last)),
-                    "ward_history": new_list,
-                }
-            )
-        patient["ward_history"] = new_list
-        st.session_state.pop(ed_key, None)
-        st.session_state[flash_key] = msg
-        st.rerun()
-
-    btn_l, btn_r, _sp = st.columns([1, 1, 6])
-    with btn_l:
-        add_row = st.button("＋", key=f"ward_row_add_{key_prefix}_{pid}", help="Добавить строку", use_container_width=True)
-    with btn_r:
-        del_row = st.button("−", key=f"ward_row_del_{key_prefix}_{pid}", help="Удалить последнюю строку", use_container_width=True)
-
-    if add_row:
-        rows = list(hist)
-        last_day = max((int(e.get("day") or 0) for e in rows), default=-2)
-        next_day = last_day + 2
-        labs0 = dict(patient.get("labs_day0") or {})
-        rows.append(
-            normalize_ward_entry(
-                {
-                    "day": next_day,
-                    "label": f"День {next_day}",
-                    "bp": patient.get("bp_office") or "140/90",
-                    "hr": patient.get("hr") or 75,
-                    "weight_kg": patient.get("weight_kg") or 80,
-                    "labs": labs0,
-                    "exam": "",
-                    "results": "",
-                    "notes": "",
-                }
-            )
-        )
-        rows.sort(key=lambda x: x["day"])
-        _persist_hist(rows, f"Добавлена строка · день {next_day}")
-
-    if del_row:
-        rows = list(hist)
-        if not rows:
-            st.warning("Таблица пуста")
-        else:
-            rows = sorted(rows, key=lambda x: x["day"])
-            removed = rows.pop()
-            _persist_hist(rows, f"Удалена строка · день {removed.get('day')}")
 
     df = pd.DataFrame(ward_history_to_rows(hist))
     edited = st.data_editor(
@@ -693,7 +832,7 @@ def render_ward_history_editor(
         use_container_width=True,
         key=ed_key,
         column_config={
-            "День": st.column_config.NumberColumn("День", min_value=0, max_value=60, step=1, width="small"),
+            "День": st.column_config.NumberColumn("День", min_value=1, max_value=60, step=1, width="small"),
             "АД": st.column_config.TextColumn("АД", width="small"),
             "ЧСС": st.column_config.NumberColumn("ЧСС", min_value=40, max_value=180, step=1, width="small"),
             "Вес": st.column_config.NumberColumn("Вес", format="%.1f", width="small"),
@@ -701,9 +840,9 @@ def render_ward_history_editor(
             "рСКФ": st.column_config.NumberColumn("рСКФ", format="%.1f", width="small"),
             "Креатинин": st.column_config.NumberColumn("Креатинин", format="%.1f", width="small"),
             "Глюкоза": st.column_config.NumberColumn("Глюкоза", format="%.1f", width="small"),
-            "Осмотр": st.column_config.TextColumn("Осмотр (состояние)", width="large"),
+            "Осмотр": st.column_config.TextColumn("Осмотр", width="large"),
             "Результаты": st.column_config.TextColumn("Результаты", width="large"),
-            "Заметки": st.column_config.TextColumn("Заметки", width="medium"),
+            "Заметки": st.column_config.TextColumn("Заметки о состоянии", width="medium"),
         },
         hide_index=True,
     )
@@ -715,105 +854,124 @@ def render_ward_history_editor(
         new_hist = hist
 
     st.markdown("##### Записать состояние вручную (добавить/обновить день)")
-    mc1, mc2 = st.columns([1, 3])
-    with mc1:
-        manual_day = st.number_input(
-            "День",
-            min_value=0,
-            max_value=60,
-            value=0,
-            step=1,
-            key=f"ward_manual_day_{key_prefix}_{pid}",
+    n_rows = max(2, len(hist) or int(stay_days))
+    if day_key not in st.session_state or st.session_state.get(day_anchor) != n_rows:
+        st.session_state[day_key] = n_rows
+        st.session_state[day_anchor] = n_rows
+
+    def _bump_stay(delta: int) -> None:
+        st.session_state[bump_key] = int(delta)
+        if delta > 0:
+            typed = str(st.session_state.get(text_key, "") or "").strip()
+            if typed:
+                st.session_state[pending_manual_key] = typed
+            else:
+                st.session_state.pop(pending_manual_key, None)
+        else:
+            st.session_state.pop(pending_manual_key, None)
+
+    mc_m, mc_d, mc_p, mc2 = st.columns([0.45, 0.9, 0.45, 3.2])
+    with mc_m:
+        st.write("")
+        st.write("")
+        st.button(
+            "−",
+            key=f"ward_manual_minus_{key_prefix}_{pid}",
+            help="Убрать последние сутки",
+            use_container_width=True,
+            on_click=_bump_stay,
+            args=(-1,),
+        )
+    with mc_d:
+        manual_day = int(
+            st.number_input(
+                "День",
+                min_value=1,
+                max_value=60,
+                step=1,
+                key=day_key,
+                help="По умолчанию — число строк. ± добавляет/убирает сутки без сброса таблицы.",
+            )
+        )
+    with mc_p:
+        st.write("")
+        st.write("")
+        st.button(
+            "＋",
+            key=f"ward_manual_plus_{key_prefix}_{pid}",
+            help="Добавить сутки; текст осмотра попадёт в новую строку",
+            use_container_width=True,
+            on_click=_bump_stay,
+            args=(1,),
         )
     with mc2:
         manual_text = st.text_area(
             "Текст осмотра / состояния",
             placeholder="Например: Жалобы на головокружение, АД 165/100, отёков нет…",
-            key=f"ward_manual_text_{key_prefix}_{pid}",
+            key=text_key,
             height=80,
         )
-    if st.button("Вписать в таблицу", key=f"ward_manual_apply_{key_prefix}_{pid}"):
-        text = (manual_text or "").strip()
-        if not text:
-            st.warning("Введите текст состояния")
-        else:
-            by_day = {int(e["day"]): dict(e) for e in new_hist}
-            entry = by_day.get(int(manual_day)) or {
-                "day": int(manual_day),
-                "bp": patient.get("bp_office") or "140/90",
-                "hr": patient.get("hr") or 75,
-                "weight_kg": patient.get("weight_kg") or 80,
-                "labs": dict(patient.get("labs_day0") or {}),
-                "exam": "",
-                "results": "",
-                "notes": "",
-            }
-            entry["exam"] = text
-            entry["label"] = f"День {int(manual_day)}"
-            by_day[int(manual_day)] = normalize_ward_entry(entry)
-            merged = [by_day[d] for d in sorted(by_day)]
-            if allow_save and patient.get("synthetic_id"):
-                upsert_patient(
-                    {
-                        **patient,
-                        "ward_stay_days": int(stay_days),
-                        "ward_history": merged,
-                    }
-                )
-            st.session_state.pop(ed_key, None)
-            st.session_state[flash_key] = f"Состояние дня {int(manual_day)} записано"
-            st.rerun()
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("Пересобрать историю по сценарию", key=f"ward_rebuild_{key_prefix}_{pid}"):
-            rebuilt = build_ward_history({**patient, "ward_stay_days": int(stay_days)}, stay_days=int(stay_days))
-            if allow_save and patient.get("synthetic_id"):
-                upsert_patient(
-                    {
-                        **patient,
-                        "ward_stay_days": int(stay_days),
-                        "ward_history": rebuilt,
+    save_clicked = allow_save and st.button(
+        "Сохранить историю",
+        type="primary",
+        use_container_width=True,
+        key=f"ward_save_{key_prefix}_{pid}",
+        help="Сохраняет таблицу как есть и при необходимости обновляет выбранный день из текста.",
+    )
+
+    if save_clicked:
+        if not patient.get("synthetic_id"):
+            st.error("Сначала сохраните карточку пациента")
+        else:
+            try:
+                hist_to_save = [normalize_ward_entry(e) for e in (new_hist or hist or [])]
+                parts = ["таблица"]
+                text = (manual_text or "").strip()
+                if text:
+                    by_day = {int(e["day"]): dict(e) for e in hist_to_save}
+                    entry = by_day.get(int(manual_day)) or {
+                        "day": int(manual_day),
+                        "bp": patient.get("bp_office") or "140/90",
+                        "hr": patient.get("hr") or 75,
+                        "weight_kg": patient.get("weight_kg") or 80,
+                        "labs": dict(patient.get("labs_day0") or {}),
+                        "exam": "",
+                        "results": "",
+                        "notes": "",
                     }
-                )
-            st.session_state[f"ward_stay_applied_{key_prefix}_{pid}"] = int(stay_days)
-            st.session_state.pop(ed_key, None)
-            st.session_state[flash_key] = (
-                f"История пересобрана · {int(stay_days)} сут · {len(rebuilt)} точек · "
-                f"{scenario_label(patient.get('scenario'))}"
-            )
-            st.rerun()
-    with c2:
-        if allow_save and st.button(
-            "Сохранить историю",
-            type="primary",
-            key=f"ward_save_{key_prefix}_{pid}",
-        ):
-            if not patient.get("synthetic_id"):
-                st.error("Сначала сохраните карточку пациента")
-            elif not new_hist:
-                st.error("Таблица пуста — нечего сохранять")
-            else:
-                try:
-                    last_day = max((e.get("day") or 0) for e in new_hist)
+                    entry["exam"] = text
+                    entry["notes"] = text
+                    entry["label"] = f"День {int(manual_day)}"
+                    by_day[int(manual_day)] = normalize_ward_entry(entry)
+                    hist_to_save = [by_day[d] for d in sorted(by_day)]
+                    parts.append(f"день {int(manual_day)} обновлён")
+
+                if not hist_to_save:
+                    st.error("Таблица пуста — нечего сохранять")
+                else:
+                    last_day = max((e.get("day") or 0) for e in hist_to_save)
                     upsert_patient(
                         {
                             **patient,
                             "ward_stay_days": max(int(stay_days), int(last_day)),
-                            "ward_history": new_hist,
+                            "ward_history": hist_to_save,
                         }
                     )
                     st.session_state.pop(ed_key, None)
+                    st.session_state[text_key] = ""
                     st.session_state[flash_key] = (
-                        f"История сохранена · {len(new_hist)} записей · {patient.get('full_name')}"
+                        f"История сохранена · {len(hist_to_save)} записей · "
+                        + ", ".join(parts)
+                        + f" · {patient.get('full_name')}"
                     )
                     st.toast("История сохранена", icon="✅")
                     st.rerun()
-                except Exception as e:
-                    st.error(f"Ошибка сохранения: {e}")
-    with c3:
-        st.caption(f"{len(new_hist)} записей в таблице")
+            except Exception as e:
+                st.error(f"Ошибка сохранения: {e}")
+
     return new_hist
+
 
 
 def _parse_bp(bp: str) -> tuple[float | None, float | None]:
@@ -1059,14 +1217,9 @@ def new_patient_dialog() -> None:
                 placeholder="Иванов Иван Иванович",
             )
             age = st.number_input("Возраст", 18, 100, 55)
-            st.markdown(
-                '<div class="mz-sex-wrap"><span class="mz-sex-tag">Пол</span></div>',
-                unsafe_allow_html=True,
-            )
             sex_ui = st.selectbox(
                 "Пол",
                 ["М", "Ж"],
-                label_visibility="collapsed",
                 key="form_sex",
             )
             sex = "F" if sex_ui == "Ж" else "M"
@@ -1123,7 +1276,8 @@ def new_patient_dialog() -> None:
         notes_raw = st.text_area(
             "Заметки о состоянии (каждая строка: дата | текст)",
             value="",
-            placeholder="day-14 | Головные боли по утрам\nday0 | Первичный приём, готов к терапии",
+            placeholder="day1 | Поступление. Курение отрицает. Готов к терапии.",
+            help="Заметка day1 (день поступления) синхронизируется с таблицей. День = номер строки.",
         )
         force_compl = st.checkbox("Форсировать осложнение на день 3 (гиперкалиемия)", False)
         stay_days_form = st.number_input(
@@ -1148,7 +1302,7 @@ def new_patient_dialog() -> None:
     if not (exams_raw or "").strip():
         exams_raw = "ЭКГ | Синусовый ритм | day0\nЭхоКГ | ФВ 58% | day0"
     if not (notes_raw or "").strip():
-        notes_raw = "day-14 | Головные боли по утрам\nday0 | Первичный приём, готов к терапии"
+        notes_raw = "day1 | Поступление в стационар. Первичный осмотр, готов к терапии."
 
     exams = []
     for line in exams_raw.splitlines():
@@ -1159,7 +1313,7 @@ def new_patient_dialog() -> None:
             {
                 "name": parts[0] if parts else "Обследование",
                 "result": parts[1] if len(parts) > 1 else "",
-                "date": parts[2] if len(parts) > 2 else "day0",
+                "date": parts[2] if len(parts) > 2 else "day1",
             }
         )
     notes = []
@@ -1168,9 +1322,17 @@ def new_patient_dialog() -> None:
             continue
         parts = [x.strip() for x in line.split("|", 1)]
         if len(parts) == 1:
-            notes.append({"date": "day0", "text": parts[0]})
+            notes.append({"date": "day1", "text": parts[0]})
         else:
             notes.append({"date": parts[0], "text": parts[1]})
+    note_dates = {str(n.get("date") or "").strip().lower() for n in notes}
+    if "day1" not in note_dates and "day0" not in note_dates:
+        notes.append(
+            {
+                "date": "day1",
+                "text": "Поступление в стационар. Первичный осмотр, готов к терапии.",
+            }
+        )
 
     raw = {
         "synthetic_id": f"SYN-AG-{uuid4().hex[:6].upper()}",
@@ -1204,8 +1366,25 @@ def new_patient_dialog() -> None:
         raw["ward_history"] = []
         raw["skip_ward_history"] = True
     patient = upsert_patient(raw)
-    if gen_ward and not patient.get("ward_history"):
-        patient["ward_history"] = build_ward_history(patient, stay_days=int(stay_days_form))
+    if gen_ward:
+        if not patient.get("ward_history"):
+            patient["ward_history"] = build_ward_history(patient, stay_days=int(stay_days_form))
+        # day1 из формы → в таблицу; таблица → обратно в шапку
+        day1_text = next(
+            (
+                str(n.get("text") or "").strip()
+                for n in (patient.get("health_notes") or [])
+                if str(n.get("date") or "").strip().lower() in {"day1", "day0"}
+            ),
+            "Поступление в стационар. Первичный осмотр, готов к терапии.",
+        )
+        for e in patient.get("ward_history") or []:
+            if int(e.get("day") or -1) == 1:
+                e["notes"] = day1_text
+                break
+        from digital_resident.patients import sync_state_notes
+
+        patient = sync_state_notes(patient)
         patient = upsert_patient(patient)
 
     st.session_state["selected_patient_id"] = patient["synthetic_id"]
@@ -1225,7 +1404,8 @@ def page_assignment_cases() -> None:
     labels = {c["id"]: c["title"] for c in cases}
     st.caption(
         f"Три демонстрационных кейса ТЗ — у каждого свой синтетический пациент "
-        f"({len(cases)} шт.). Выберите кейс ниже и запустите СППР."
+        f"({len(cases)} шт.). Выберите кейс ниже и запустите СППР "
+        f"(или откройте уже сохранённый прогон без API)."
     )
     case_id = st.selectbox(
         "Кейс задания",
@@ -1246,28 +1426,52 @@ def page_assignment_cases() -> None:
         key_prefix="cases",
     )
     busy = any_job_running()
-    if st.button(
-        "Запустить в фоне",
-        type="primary",
-        key="btn_case_run",
-        disabled=busy,
-    ):
-        launch_case_job("cases", case_id, f"Кейс · {case['title']}")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button(
+            "Запустить в фоне",
+            type="primary",
+            key="btn_case_run",
+            disabled=busy or not has_llm_api_key(),
+            help="Нужен NEURAL_DEEP_API_KEY в .env",
+        ):
+            launch_case_job("cases", case_id, f"Кейс · {case['title']}")
+    with c2:
+        if st.button(
+            "Показать сохранённый результат",
+            key="btn_case_cached",
+            help="Читает data/result_<case>.json — API не нужен",
+        ):
+            cached = load_cached_case_result(case_id)
+            if not cached:
+                st.error(f"Нет файла data/result_{case_id}.json")
+            else:
+                st.session_state["cached_case_view"] = cached
+                st.toast(f"Загружен сохранённый прогон: {case_id}", icon="📄")
 
     res = get_result("cases")
     if res:
         render_result(res, key_prefix="cases")
+    elif st.session_state.get("cached_case_view"):
+        render_result(st.session_state["cached_case_view"], key_prefix="cases_cached")
 
 
 def main() -> None:
-    inject()
     init_state()
+    go_home_if_requested()
+    inject()
     seed_cohort(force=False)
 
     # если сайдбар был свёрнут — кнопка раскрытия вверху слева;
     # дублируем быстрый доступ к пациентам и на главной
     with st.sidebar:
         st.markdown("### Статус СППР")
+        if not has_llm_api_key():
+            st.info(
+                "Режим без API: когорта и UI доступны; "
+                "кейсы — через «Показать сохранённый результат»; "
+                "живой план/аудит — после `.env` с ключом."
+            )
         job_status_panel()
         st.divider()
         sel = st.session_state.get("selected_patient_id")
@@ -1297,8 +1501,7 @@ def main() -> None:
         page_assignment_cases()
 
     st.markdown(
-        '<div class="mz-footer">Синтетические данные. Не является медицинской рекомендацией. '
-        "СППР выполняется в фоне — формы не блокируются.</div>",
+        '<div class="mz-footer">Синтетические данные. Не является медицинской рекомендацией.</div>',
         unsafe_allow_html=True,
     )
 
